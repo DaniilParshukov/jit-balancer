@@ -6,6 +6,10 @@ import org.nsu.syspro.parprog.external.*;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 
 public class SolutionThread extends UserThread {
     private static final int L1_COMPILATION_THRESHOLD = 10_000;
@@ -14,8 +18,16 @@ public class SolutionThread extends UserThread {
     private static final ConcurrentHashMap<MethodID, CompiledMethodWithLevel> globalCache = new ConcurrentHashMap<>();
     private final Map<MethodID, Integer> counters = new HashMap<>();
 
+    private static ExecutorService compilationPool;
+
     public SolutionThread(int compilationThreadBound, ExecutionEngine exec, CompilationEngine compiler, Runnable r) {
         super(compilationThreadBound, exec, compiler, r);
+
+        synchronized (SolutionThread.class) {
+            if (compilationPool == null) {
+                compilationPool = Executors.newFixedThreadPool(compilationThreadBound);
+            }
+        }
     }
 
     @Override
@@ -25,17 +37,30 @@ public class SolutionThread extends UserThread {
         OptimizationLevel currentLevel = (current != null) ? current.optimizationLevel : OptimizationLevel.INTERPRETED;
 
         if (count >= L2_COMPILATION_THRESHOLD && OptimizationLevel.L2.isBetterThan(currentLevel)) {
-            current = new CompiledMethodWithLevel(compiler.compile_l2(id), OptimizationLevel.L2);
-            globalCache.put(id, current);
+            scheduleCompilation(id, OptimizationLevel.L2);
+            current = globalCache.get(id);
         } else if (count >= L1_COMPILATION_THRESHOLD && OptimizationLevel.L1.isBetterThan(currentLevel)) {
-            current = new CompiledMethodWithLevel(compiler.compile_l1(id), OptimizationLevel.L1);
-            globalCache.put(id, current);
+            scheduleCompilation(id, OptimizationLevel.L1);
+            current = globalCache.get(id);
         }
 
         if (current != null) {
             return exec.execute(current.compiledMethod);
         }
         return exec.interpret(id);
+    }
+
+    private void scheduleCompilation(MethodID id, OptimizationLevel level) {
+        Future<CompiledMethod> future = compilationPool.submit(() -> {
+            return (level == OptimizationLevel.L1) ? compiler.compile_l1(id) : compiler.compile_l2(id);
+        });
+        try {
+            //future.get() waits if necessary for the computation to complete, and then retrieves its result.
+            CompiledMethodWithLevel compiled = new CompiledMethodWithLevel(future.get(), level);
+            globalCache.put(id, compiled);
+        } catch (InterruptedException | ExecutionException e) {
+            Thread.currentThread().interrupt();
+        }
     }
 
     public enum OptimizationLevel {
